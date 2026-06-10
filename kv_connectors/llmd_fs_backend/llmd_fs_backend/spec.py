@@ -45,7 +45,23 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
     """
 
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
-        super().__init__(vllm_config, kv_cache_config)
+        # vLLM's OffloadingSpec base derives block_size_factor from
+        # extra_config["block_size"] and asserts that all KV cache groups
+        # share one GPU block size to do so — which hybrid models like
+        # Gemma do not satisfy
+        # (https://github.com/llm-d/llm-d-kv-cache/issues/657).
+        # This backend sizes files in hash_block_size granularity, which
+        # supports non-uniform group block sizes, so hide "block_size" from
+        # the base class and derive block_size_factor ourselves below.
+        kv_transfer_config = vllm_config.kv_transfer_config
+        assert kv_transfer_config is not None
+        extra_config = kv_transfer_config.kv_connector_extra_config
+        hidden_block_size = extra_config.pop("block_size", None)
+        try:
+            super().__init__(vllm_config, kv_cache_config)
+        finally:
+            if hidden_block_size is not None:
+                extra_config["block_size"] = hidden_block_size
 
         self._manager: OffloadingManager | None = None
         # worker-side
@@ -75,13 +91,13 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
         )
         self.gpu_blocks_per_file = self.offloaded_block_size // self.hash_block_size
 
-        # vLLM's OffloadingSpec base only derives block_size_factor when
-        # "block_size" is explicitly present in extra_config, leaving it at 1
-        # otherwise — but we default offloaded_block_size ourselves, so the
-        # scheduler must be kept in sync. With a stale factor of 1 the
-        # scheduler emits one offload key per GPU block while the worker
-        # consumes one key per file, misaligning keys across KV cache groups
-        # on hybrid models (https://github.com/llm-d/llm-d-kv-cache/issues/656).
+        # The base class never sees "block_size" (hidden above), so it leaves
+        # block_size_factor at 1. Derive it here: the scheduler emits one
+        # offload key per offloaded block (gpu_block_size * factor tokens,
+        # per group) while the worker consumes one key per file
+        # (gpu_blocks_per_file blocks), and a mismatch misaligns keys across
+        # KV cache groups on hybrid models
+        # (https://github.com/llm-d/llm-d-kv-cache/issues/656).
         self.block_size_factor = self.gpu_blocks_per_file
 
         self.read_preferring_ratio = float(
